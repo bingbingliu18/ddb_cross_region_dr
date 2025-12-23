@@ -71,8 +71,8 @@ Resources:
           Properties:
             Stream: !Ref SourceTableStreamARN
             StartingPosition: TRIM_HORIZON
-            BatchSize: 100
-            MaximumBatchingWindowInSeconds: 5
+            BatchSize: 1000
+            MaximumBatchingWindowInSeconds: 60
             MaximumRecordAgeInSeconds: !Ref MaximumRecordAgeInSeconds
 
 Outputs:
