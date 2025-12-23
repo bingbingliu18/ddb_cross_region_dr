@@ -1,0 +1,84 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Lambda function that reads from DynamoDB Stream and saves changes to cross-account S3
+    
+Parameters:
+  TargetS3Bucket: 
+    Type: String
+    Description: Target S3 bucket name for storing DynamoDB changes
+  TargetRegion: 
+    Type: String
+    Default: 'us-west-2'
+    Description: The region for the target S3 bucket
+  TargetAccountNumber: 
+    Type: String
+    Description: Target AWS Account Number
+  MaximumRecordAgeInSeconds: 
+    Type: String
+    Default: '3600'
+    Description: The maximum age (in seconds) of a record that Lambda sends to your function
+  TargetRoleName: 
+    Type: String
+    Description: Target IAM Role name to be assumed by Lambda function
+  SourceTableStreamARN:
+    Type: String
+    Description: Source DynamoDB table stream ARN
+  S3Prefix:
+    Type: String
+    Default: 'ddb-changes'
+    Description: S3 prefix for storing change files
+
+Resources:
+  StreamToS3Function:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/
+      Handler: stream_to_s3.lambda_handler
+      Runtime: python3.9
+      Timeout: 900
+      MemorySize: 512
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:DescribeStream
+                - dynamodb:GetRecords
+                - dynamodb:GetShardIterator
+                - dynamodb:ListStreams
+              Resource: !Ref SourceTableStreamARN
+            - Effect: Allow
+              Action:
+                - sts:AssumeRole
+              Resource: !Sub "arn:aws:iam::${TargetAccountNumber}:role/${TargetRoleName}"
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: '*'
+      Environment:
+        Variables:
+          TARGET_AWS_ACCOUNT_NUMBER: !Ref TargetAccountNumber
+          TARGET_S3_BUCKET: !Ref TargetS3Bucket
+          TARGET_ROLE_NAME: !Ref TargetRoleName
+          TARGET_REGION: !Ref TargetRegion
+          S3_PREFIX: !Ref S3Prefix
+      Events:
+        DDBStreamEvent:
+          Type: DynamoDB
+          Properties:
+            Stream: !Ref SourceTableStreamARN
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 100
+            MaximumBatchingWindowInSeconds: 5
+            MaximumRecordAgeInSeconds: !Ref MaximumRecordAgeInSeconds
+
+Outputs:
+  StreamToS3Function:
+    Description: "Lambda Function ARN"
+    Value: !GetAtt StreamToS3Function.Arn
+  StreamToS3FunctionIamRole:
+    Description: "Implicit IAM Role created for function"
+    Value: !GetAtt StreamToS3FunctionRole.Arn
