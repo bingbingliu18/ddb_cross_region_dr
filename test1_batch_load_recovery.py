@@ -297,8 +297,12 @@ class BatchLoadRecoveryTest:
         self.export_start_time = datetime.now(timezone.utc)
         
         try:
+            # 动态获取当前账户ID
+            sts = boto3.client('sts')
+            account_id = sts.get_caller_identity()['Account']
+            
             response = self.ddb_source.export_table_to_point_in_time(
-                TableArn=f'arn:aws:dynamodb:{self.source_region}:028183925784:table/{self.source_table}',
+                TableArn=f'arn:aws:dynamodb:{self.source_region}:{account_id}:table/{self.source_table}',
                 S3Bucket=self.backup_bucket,
                 S3Prefix=f'full-backups/{self.source_table}/{self.export_start_time.strftime("%Y%m%d_%H%M%S")}/',
                 ExportFormat='DYNAMODB_JSON'
@@ -369,101 +373,34 @@ class BatchLoadRecoveryTest:
             logger.info("目标表不存在，跳过删除")
             return True
 
-    def restore_from_export(self):
-        """从最新export恢复"""
-        logger.info("📦 从export恢复数据...")
+    def disaster_recovery(self):
+        """使用disaster_recovery_manager进行完整恢复 (全量+增量)"""
+        logger.info("🚨 开始灾难恢复 (全量+增量)...")
         
         try:
-            # 使用disaster_recovery_manager恢复，它会自动找到最新的备份
-            import subprocess
-            cmd = [
-                'python3', 'disaster_recovery_manager.py',
-                '--source-table', self.source_table,
-                '--target-table', self.target_table,
-                '--backup-bucket', self.backup_bucket,
-                '--source-region', self.source_region,
-                '--target-region', self.target_region
-            ]
+            from disaster_recovery_manager import DisasterRecoveryManager
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-            if result.returncode == 0:
-                logger.info("✅ Export恢复完成")
-                return True
-            else:
-                logger.error(f"❌ Export恢复失败: {result.stderr}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"❌ Export恢复执行失败: {e}")
-            return False
-
-    def apply_incremental_changes(self):
-        """使用enhanced_batch_applier应用增量变更"""
-        logger.info("🔄 应用增量变更...")
-        
-        try:
-            # 查找export时间之后的增量文件
-            prefix = 'ddb-changes/'
-            response = self.s3.list_objects_v2(
-                Bucket=self.backup_bucket,
-                Prefix=prefix
+            dr_manager = DisasterRecoveryManager(
+                self.source_region,
+                self.target_region, 
+                self.backup_bucket
             )
             
-            if 'Contents' not in response:
-                logger.warning("未找到增量文件")
-                return True
+            # 执行完整的灾难恢复 (全量 + 增量)
+            success = dr_manager.full_disaster_recovery(
+                self.source_table,
+                self.target_table
+            )
             
-            # 过滤出export时间之后的文件
-            incremental_files = []
-            for obj in response['Contents']:
-                # 从文件名中提取时间戳
-                key = obj['Key']
-                if key.endswith('.json'):
-                    # 假设文件名包含时间戳
-                    file_time = obj['LastModified']
-                    if file_time > self.export_start_time:
-                        incremental_files.append(key)
-            
-            if not incremental_files:
-                logger.info("没有需要应用的增量变更")
-                return True
-            
-            logger.info(f"找到 {len(incremental_files)} 个增量文件")
-            
-            # 按时间排序
-            incremental_files.sort()
-            
-            # 逐个应用增量文件
-            success_count = 0
-            for file_key in incremental_files:
-                s3_path = f's3://{self.backup_bucket}/{file_key}'
-                logger.info(f"应用增量文件: {file_key}")
-                
-                import subprocess
-                cmd = [
-                    'python3', 'enhanced_batch_applier.py',
-                    '--s3-file-path', s3_path,
-                    '--target-table', self.target_table,
-                    '--region', self.target_region,
-                    '--batch-size', '100'
-                ]
-                
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-                if result.returncode == 0:
-                    success_count += 1
-                    logger.info(f"✅ 文件应用成功: {file_key}")
-                else:
-                    logger.error(f"❌ 文件应用失败: {file_key} - {result.stderr}")
-            
-            if success_count == len(incremental_files):
-                logger.info("✅ 所有增量变更应用完成")
+            if success:
+                logger.info("✅ 灾难恢复完成 (全量+增量)")
                 return True
             else:
-                logger.error(f"❌ 部分增量变更应用失败: {success_count}/{len(incremental_files)}")
+                logger.error("❌ 灾难恢复失败")
                 return False
                 
         except Exception as e:
-            logger.error(f"❌ 增量变更应用执行失败: {e}")
+            logger.error(f"❌ 灾难恢复执行失败: {e}")
             return False
     
     def verify_data_consistency(self):
@@ -513,8 +450,8 @@ class BatchLoadRecoveryTest:
     def run_test(self):
         """运行完整测试"""
         logger.info("=" * 60)
-        logger.info("🧪 测试1: 批量数据加载恢复测试 (新流程)")
-        logger.info("流程: 删除目标表 -> 从export恢复 -> 应用增量变更")
+        logger.info("🧪 测试1: 批量数据加载恢复测试 (使用disaster_recovery_manager)")
+        logger.info("流程: 删除目标表 -> disaster_recovery_manager完整恢复 (全量+增量)")
         logger.info("=" * 60)
         
         test_results = {
@@ -553,15 +490,11 @@ class BatchLoadRecoveryTest:
             if not self.wait_for_export_completion():
                 raise Exception("Export未完成")
             
-            # 9. 从export恢复（disaster_recovery_manager会自动处理目标表）
-            if not self.restore_from_export():
-                raise Exception("Export恢复失败")
+            # 9. 从export恢复（disaster_recovery_manager会自动处理目标表和增量）
+            if not self.disaster_recovery():
+                raise Exception("灾难恢复失败")
             
-            # 10. 应用增量变更
-            if not self.apply_incremental_changes():
-                raise Exception("增量变更应用失败")
-            
-            # 11. 验证数据一致性
+            # 10. 验证数据一致性
             consistency_ok = self.verify_data_consistency()
             
             # 记录结果

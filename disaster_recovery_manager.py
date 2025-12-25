@@ -7,6 +7,7 @@ Implements complete recovery workflow with full + incremental backup
 import boto3
 import json
 import os
+import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 import time
@@ -19,6 +20,7 @@ class DisasterRecoveryManager:
         self.ddb_source = boto3.client('dynamodb', region_name=source_region)
         self.ddb_target = boto3.client('dynamodb', region_name=target_region)
         self.s3_client = boto3.client('s3')
+        self.logger = None  # Will be initialized in full_disaster_recovery
         
         # Validate backup bucket exists
         try:
@@ -28,11 +30,28 @@ class DisasterRecoveryManager:
         except Exception as e:
             raise ValueError(f"❌ Cannot access backup bucket '{backup_bucket}': {e}")
     
+    def _setup_logger(self, log_filename: str):
+        """Setup unified logger for disaster recovery"""
+        self.logger = logging.getLogger(f"disaster_recovery_{id(self)}")
+        if not self.logger.handlers:
+            self.logger.setLevel(logging.INFO)
+            formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+            
+            # File handler
+            file_handler = logging.FileHandler(log_filename, mode='a')
+            file_handler.setFormatter(formatter)
+            self.logger.addHandler(file_handler)
+            
+            # Console handler
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(formatter)
+            self.logger.addHandler(console_handler)
+    
     def find_latest_full_backup(self, table_name: str, before_time: Optional[str] = None, 
                                backup_dir: Optional[str] = None) -> Optional[Dict]:
         """Find the latest full backup or use specified backup directory"""
         try:
-            # 如果指定了备份目录，直接使用
+            # If backup directory is specified, use it directly
             if backup_dir:
                 return self._load_backup_from_dir(table_name, backup_dir)
             
@@ -65,15 +84,18 @@ class DisasterRecoveryManager:
                         print(f"⚠️ Skip invalid backup metadata: {obj['Key']}")
             
             if not backups:
+                self.logger.info("❌ No backup metadata found") if self.logger else print("❌ No backup metadata found")
                 return None
                 
             # Sort by time, return latest
             latest = sorted(backups, key=lambda x: x['export_time'], reverse=True)[0]
-            print(f"📦 Found latest full backup: {latest['export_time']}")
+            msg = f"📦 Found latest full backup: {latest['export_time']}"
+            self.logger.info(msg) if self.logger else print(msg)
             return latest
             
         except Exception as e:
-            print(f"❌ Failed to find full backup: {e}")
+            msg = f"❌ Failed to find full backup: {e}"
+            self.logger.error(msg) if self.logger else print(msg)
             return None
     
     def _load_backup_from_dir(self, table_name: str, backup_dir: str) -> Optional[Dict]:
@@ -82,7 +104,8 @@ class DisasterRecoveryManager:
             # Construct metadata file path
             metadata_key = f"backup-metadata/{table_name}/{backup_dir}.json"
             
-            print(f"📂 Using specified full backup directory: {backup_dir}")
+            msg = f"📂 Using specified full backup directory: {backup_dir}"
+            self.logger.info(msg) if self.logger else print(msg)
             
             try:
                 metadata_obj = self.s3_client.get_object(
@@ -90,15 +113,18 @@ class DisasterRecoveryManager:
                     Key=metadata_key
                 )
                 metadata = json.loads(metadata_obj['Body'].read())
-                print(f"✅ Loaded backup metadata: {metadata['export_time']}")
+                msg = f"✅ Loaded backup metadata: {metadata['export_time']}"
+                self.logger.info(msg) if self.logger else print(msg)
                 return metadata
                 
             except self.s3_client.exceptions.NoSuchKey:
-                print(f"❌ Backup metadata not found for specified directory: {metadata_key}")
+                msg = f"❌ Backup metadata not found for specified directory: {metadata_key}"
+                self.logger.error(msg) if self.logger else print(msg)
                 return None
                 
         except Exception as e:
-            print(f"❌ Failed to load specified backup: {e}")
+            msg = f"❌ Failed to load specified backup: {e}"
+            self.logger.error(msg) if self.logger else print(msg)
             return None
     
     def restore_from_full_backup(self, backup_metadata: Dict, target_table: str) -> bool:
@@ -134,11 +160,13 @@ class DisasterRecoveryManager:
             return response['ImportTableDescription']['ImportArn']
         
         try:
-            print(f"🔄 Starting restore from full backup to table: {target_table}")
+            msg = f"🔄 Starting restore from full backup to table: {target_table}"
+            self.logger.info(msg) if self.logger else print(msg)
             
             # Start Import (with retry)
             import_arn = _start_import()
-            print(f"✅ Full restore started: {import_arn}")
+            msg = f"✅ Full restore started: {import_arn}"
+            self.logger.info(msg) if self.logger else print(msg)
             
             # Wait for import completion (with retry check)
             max_wait_time = 3600  # Maximum wait 1 hour
@@ -151,28 +179,34 @@ class DisasterRecoveryManager:
                     status = status_response['ImportTableDescription']['ImportStatus']
                     
                     if status == 'COMPLETED':
-                        print(f"✅ Full restore completed")
+                        msg = f"✅ Full restore completed"
+                        self.logger.info(msg) if self.logger else print(msg)
                         return True
                     elif status == 'FAILED':
                         failure_code = status_response['ImportTableDescription'].get('FailureCode', 'Unknown')
                         failure_msg = status_response['ImportTableDescription'].get('FailureMessage', 'Unknown')
-                        print(f"❌ Full restore failed: {failure_code} - {failure_msg}")
+                        msg = f"❌ Full restore failed: {failure_code} - {failure_msg}"
+                        self.logger.error(msg) if self.logger else print(msg)
                         return False
                     else:
-                        print(f"🔄 Full restore in progress: {status}")
+                        msg = f"🔄 Full restore in progress: {status}"
+                        self.logger.info(msg) if self.logger else print(msg)
                         time.sleep(check_interval)
                         elapsed_time += check_interval
                         
                 except Exception as e:
-                    print(f"⚠️ Failed to check Import status, retrying: {e}")
+                    msg = f"⚠️ Failed to check Import status, retrying: {e}"
+                    self.logger.warning(msg) if self.logger else print(msg)
                     time.sleep(check_interval)
                     elapsed_time += check_interval
             
-            print(f"❌ Full restore timeout ({max_wait_time} seconds)")
+            msg = f"❌ Full restore timeout ({max_wait_time} seconds)"
+            self.logger.error(msg) if self.logger else print(msg)
             return False
             
         except Exception as e:
-            print(f"❌ Full restore failed: {e}")
+            msg = f"❌ Full restore failed: {e}"
+            self.logger.error(msg) if self.logger else print(msg)
             return False
     
     def find_incremental_changes(self, export_arn: str) -> List[str]:
@@ -184,11 +218,22 @@ class DisasterRecoveryManager:
             
             # Parse export time and subtract 60 seconds
             from datetime import datetime, timezone, timedelta
-            export_time = datetime.fromisoformat(export_time_str.replace('Z', '+00:00'))
+            
+            # Handle both string and datetime object
+            if isinstance(export_time_str, str):
+                export_time = datetime.fromisoformat(export_time_str.replace('Z', '+00:00'))
+            else:
+                # Already a datetime object
+                export_time = export_time_str
+                if export_time.tzinfo is None:
+                    export_time = export_time.replace(tzinfo=timezone.utc)
+            
             start_time = export_time - timedelta(seconds=60)
             
-            print(f"📅 Export time: {export_time}")
-            print(f"📅 Looking for changes from: {start_time}")
+            msg = f"📅 Export time: {export_time}"
+            self.logger.info(msg) if self.logger else print(msg)
+            msg = f"📅 Looking for changes from: {start_time}"
+            self.logger.info(msg) if self.logger else print(msg)
             
             # List all change files in ddb-changes/ directory
             prefix = "ddb-changes/"
@@ -198,7 +243,8 @@ class DisasterRecoveryManager:
             )
             
             if 'Contents' not in response:
-                print(f"ℹ️ No change files found in {prefix}")
+                msg = f"ℹ️ No change files found in {prefix}"
+                self.logger.info(msg) if self.logger else print(msg)
                 return []
             
             # Filter and sort files by timestamp
@@ -206,46 +252,52 @@ class DisasterRecoveryManager:
             for obj in response['Contents']:
                 file_key = obj['Key']
                 if file_key.endswith('.json'):
-                    # Extract timestamp from filename (assuming format: ddb_changes_YYYYMMDD_HHMMSS_*.json)
-                    import re
-                    match = re.search(r'ddb_changes_(\d{8})_(\d{6})', file_key)
-                    if match:
-                        date_str, time_str = match.groups()
-                        file_time = datetime.strptime(f"{date_str}_{time_str}", "%Y%m%d_%H%M%S")
+                    # Use S3 LastModified time instead of parsing filename
+                    # This is more reliable than parsing complex filename timestamps
+                    file_time = obj['LastModified']
+                    
+                    # Ensure timezone awareness
+                    if file_time.tzinfo is None:
                         file_time = file_time.replace(tzinfo=timezone.utc)
-                        
-                        # Include files from start_time onwards
-                        if file_time >= start_time:
-                            change_files.append((file_time, file_key))
+                    
+                    # Include files from start_time onwards
+                    if file_time >= start_time:
+                        change_files.append((file_time, file_key))
             
             # Sort by timestamp and return file keys
             change_files.sort(key=lambda x: x[0])
             sorted_files = [file_key for _, file_key in change_files]
             
-            print(f"📄 Found {len(sorted_files)} change files to apply")
+            msg = f"📄 Found {len(sorted_files)} change files to apply"
+            self.logger.info(msg) if self.logger else print(msg)
             for file_key in sorted_files[:5]:  # Show first 5
-                print(f"  - {file_key}")
+                msg = f"  - {file_key}"
+                self.logger.info(msg) if self.logger else print(msg)
             if len(sorted_files) > 5:
-                print(f"  ... and {len(sorted_files) - 5} more files")
+                msg = f"  ... and {len(sorted_files) - 5} more files"
+                self.logger.info(msg) if self.logger else print(msg)
             
             return sorted_files
             
         except Exception as e:
-            print(f"❌ Failed to find incremental changes: {e}")
+            msg = f"❌ Failed to find incremental changes: {e}"
+            self.logger.error(msg) if self.logger else print(msg)
             return []
     
-    def apply_incremental_changes(self, change_files: List[str], target_table: str) -> bool:
+    def apply_incremental_changes(self, change_files: List[str], target_table: str, log_suffix: str) -> bool:
         """Apply incremental changes using flat structure (all files in ddb-changes/)"""
         try:
-            print("📄 Using enhanced batch applier for flat structure")
+            msg = "📄 Using enhanced batch applier for flat structure"
+            self.logger.info(msg) if self.logger else print(msg)
             from enhanced_batch_applier import EnhancedBatchApplier
             
-            # Create single applier instance with shared log file for entire recovery process
-            recovery_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            applier = EnhancedBatchApplier(target_table, self.target_region, log_suffix=f"recovery_{recovery_timestamp}")
+            # Create single applier instance for all files to share the same log
+            log_filename = f"apply_changes_{target_table}_{log_suffix}.log"
+            applier = EnhancedBatchApplier(target_table, self.target_region, log_suffix=log_suffix, shared_log_file=log_filename)
             
             for file_key in change_files:
-                print(f"🔄 Applying change file: {file_key}")
+                msg = f"🔄 Applying change file: {file_key}"
+                self.logger.info(msg) if self.logger else print(msg)
                 s3_path = f"s3://{self.backup_bucket}/{file_key}"
                 
                 # Use enhanced applier (with retry)
@@ -256,41 +308,57 @@ class DisasterRecoveryManager:
                     try:
                         success = applier.apply_changes_from_s3(s3_path)
                         if success:
-                            print(f"✅ Change file applied successfully: {file_key}")
+                            msg = f"✅ Change file applied successfully: {file_key}"
+                            self.logger.info(msg) if self.logger else print(msg)
                             file_success = True
                             break
                         else:
-                            print(f"⚠️ Change file application failed: {file_key}")
+                            msg = f"⚠️ Change file application failed: {file_key}"
+                            self.logger.warning(msg) if self.logger else print(msg)
                             
                     except Exception as e:
                         if retry_attempt < max_file_retries - 1:
                             delay = 2 ** retry_attempt
-                            print(f"⚠️ File {file_key} processing failed, retrying in {delay}s: {e}")
+                            msg = f"⚠️ File {file_key} processing failed, retrying in {delay}s: {e}"
+                            self.logger.warning(msg) if self.logger else print(msg)
                             time.sleep(delay)
                         else:
-                            print(f"❌ File {file_key} final failure: {e}")
+                            msg = f"❌ File {file_key} final failure: {e}"
+                            self.logger.error(msg) if self.logger else print(msg)
                 
                 if not file_success:
-                    print(f"❌ Failed to apply change file: {file_key}")
+                    msg = f"❌ Failed to apply change file: {file_key}"
+                    self.logger.error(msg) if self.logger else print(msg)
                     return False
                     
-            print(f"✅ All incremental changes applied")
+            msg = f"✅ All incremental changes applied"
+            self.logger.info(msg) if self.logger else print(msg)
             return True
             
         except Exception as e:
-            print(f"❌ Failed to apply incremental changes: {e}")
+            msg = f"❌ Failed to apply incremental changes: {e}"
+            self.logger.error(msg) if self.logger else print(msg)
             return False
     
     def full_disaster_recovery(self, source_table: str, target_table: str, 
                              disaster_time: Optional[str] = None,
                              backup_dir: Optional[str] = None) -> bool:
         """Complete disaster recovery workflow"""
-        print(f"🚨 Starting disaster recovery: {source_table} → {target_table}")
+        # Create unified log filename for entire disaster recovery process
+        recovery_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        log_suffix = f"disaster_recovery_{recovery_timestamp}"
+        log_filename = f"apply_changes_{target_table}_{log_suffix}.log"
+        
+        # Setup unified logger
+        self._setup_logger(log_filename)
+        
+        self.logger.info(f"🚨 Starting disaster recovery: {source_table} → {target_table}")
+        self.logger.info(f"📝 Disaster recovery log: {log_filename}")
         
         # 1. Find latest full backup or use specified directory
         backup_metadata = self.find_latest_full_backup(source_table, disaster_time, backup_dir)
         if not backup_metadata:
-            print(f"❌ No available full backup found")
+            self.logger.error(f"❌ No available full backup found")
             return False
         
         # 2. Restore from full backup
@@ -300,12 +368,13 @@ class DisasterRecoveryManager:
         # 3. Find and apply incremental changes
         change_files = self.find_incremental_changes(backup_metadata['export_arn'])
         if change_files:
-            if not self.apply_incremental_changes(change_files, target_table):
+            if not self.apply_incremental_changes(change_files, target_table, log_suffix):
                 return False
         else:
-            print(f"ℹ️ No incremental changes to apply")
+            self.logger.info(f"ℹ️ No incremental changes to apply")
         
-        print(f"🎉 Disaster recovery completed!")
+        self.logger.info(f"🎉 Disaster recovery completed!")
+        self.logger.info(f"📝 Detailed logs available at: {log_filename}")
         return True
 
 if __name__ == "__main__":
